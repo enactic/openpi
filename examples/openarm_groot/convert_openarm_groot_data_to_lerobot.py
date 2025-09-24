@@ -3,19 +3,19 @@ This script converts a custom dataset in the openarm_groot format to the LeRobot
 
 Usage:
 uv run examples/openarm_groot/convert_openarm_groot_data_to_lerobot.py --data-dir /path/to/your/data
-
-To push the dataset to the Hugging Face Hub, use the --push-to-hub flag:
-uv run examples/openarm_groot/convert_openarm_groot_data_to_lerobot.py --data-dir /path/to/your/data --push-to-hub
 """
 
+import json
 import shutil
 from pathlib import Path
-import polars as pl
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
-import tyro
 
-# TODO: Replace with your Hugging Face username and a dataset name.
-REPO_NAME = "your_hf_username/openarm_groot"
+import numpy as np
+import polars as pl
+import tyro
+from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+
+# TODO: Replace with a local directory name for your dataset.
+REPO_NAME = "openarm_groot_lerobot"
 # This is the frames per second of the videos. From the README, this is 20.
 FPS = 20
 
@@ -25,7 +25,8 @@ def main(data_dir: Path):
     Converts the openarm_groot dataset to the LeRobot format.
 
     Args:
-        data_dir: The path to the raw openarm_groot data.
+        data_dir: The path to the raw openarm_groot data, which contains
+                  the `data`, `meta`, and `videos` directories.
     """
     # Clean up any existing dataset in the output directory
     output_path = HF_LEROBOT_HOME / REPO_NAME
@@ -33,8 +34,8 @@ def main(data_dir: Path):
         print(f"Removing existing dataset at {output_path}")
         shutil.rmtree(output_path)
 
-    # TODO: Adjust the feature definition based on your dataset's specifics.
-    # The shapes for state and actions are placeholders.
+    # Create the LeRobot dataset with the correct feature shapes.
+    # We use float32 as it's the standard for training.
     dataset = LeRobotDataset.create(
         repo_id=REPO_NAME,
         fps=FPS,
@@ -46,69 +47,73 @@ def main(data_dir: Path):
             },
             "observation.state": {
                 "dtype": "float32",
-                "shape": (10,),  # TODO: Change this to your state dimension
+                "shape": (8,),
                 "names": ["state"],
             },
             "action": {
                 "dtype": "float32",
-                "shape": (7,),  # TODO: Change this to your action dimension
+                "shape": (8,),
                 "names": ["action"],
             },
         },
-        # These can be adjusted for performance
         image_writer_threads=10,
         image_writer_processes=5,
     )
 
-    # Find all episode directories. This assumes a structure like:
-    # data_dir/
-    # |- episode_000000/
-    # |  |- trajectory.parquet
-    # |  |- video.mp4
-    # |- episode_000001/
-    # |  |- trajectory.parquet
-    # |  |- video.mp4
-    # ...
-    episode_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()])
+    # Load the task descriptions from meta/tasks.jsonl
+    tasks_file = data_dir / "meta" / "tasks.jsonl"
+    if not tasks_file.exists():
+        raise FileNotFoundError(f"tasks.jsonl not found at {tasks_file}")
 
-    for episode_dir in episode_dirs:
-        print(f"Processing episode: {episode_dir.name}")
-        trajectory_file = episode_dir / "trajectory.parquet"
-        video_file = episode_dir / "video.mp4"
+    task_map = {}
+    with tasks_file.open("r") as f:
+        for line in f:
+            task_data = json.loads(line)
+            task_map[task_data["task_index"]] = task_data["task"]
+    print(f"Loaded {len(task_map)} task descriptions.")
 
-        if not trajectory_file.exists() or not video_file.exists():
-            print(f"Skipping {episode_dir.name}: missing trajectory or video file.")
+    # Find all trajectory files in the data directory
+    parquet_files = sorted(list(data_dir.glob("data/**/*.parquet")))
+    if not parquet_files:
+        raise FileNotFoundError(f"No .parquet files found in {data_dir / 'data'}")
+
+    print(f"Found {len(parquet_files)} trajectory files to process.")
+
+    for trajectory_file in parquet_files:
+        print(f"Processing episode: {trajectory_file.stem}")
+
+        # Determine the corresponding video file path
+        episode_name = trajectory_file.stem
+        chunk_name = trajectory_file.parent.name
+        video_file = (
+            data_dir / "videos" / chunk_name / "observation.images.ego_view" / f"{episode_name}.mp4"
+        )
+
+        if not video_file.exists():
+            print(f"Warning: Video file not found for {episode_name}, skipping episode.")
             continue
 
-        # Read the trajectory data
         df = pl.read_parquet(trajectory_file)
 
-        # Get the task description. Assuming it's the same for all steps in an episode.
-        # TODO: Change this if the task description varies per step.
-        task_description = df["annotation.human.action.task_description"][0]
-
         for row in df.iter_rows(named=True):
+            task_index = row["annotation.human.action.task_description"]
+            task_description = task_map.get(task_index, "")
+
+            if not task_description:
+                print(f"Warning: No task description found for task_index {task_index}")
+
             dataset.add_frame(
                 {
-                    "observation.state": row["observation.state"],
-                    "action": row["action"],
+                    "observation.state": np.array(row["observation.state"], dtype=np.float32),
+                    "action": np.array(row["action"], dtype=np.float32),
                     "task": task_description,
                 }
             )
 
         dataset.save_episode(video_path=video_file)
 
-    print("Dataset conversion complete.")
-
-    if push_to_hub:
-        print("Pushing dataset to Hugging Face Hub...")
-        dataset.push_to_hub(
-            tags=["openarm_groot", "lerobot"],
-            private=False,  # Set to True if you want a private dataset
-            push_videos=True,
-            license="apache-2.0",
-        )
-        print("Push to Hub complete.")
+    print("\nDataset conversion complete!")
+    print(f"The converted dataset is saved at: {output_path}")
 
 
 if __name__ == "__main__":
