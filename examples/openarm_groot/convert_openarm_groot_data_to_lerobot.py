@@ -72,6 +72,9 @@ def main(data_dir: Path):
             task_map[task_data["task_index"]] = task_data["task"]
     print(f"Loaded {len(task_map)} task descriptions.")
 
+    # Create a dummy image to pass validation. This will be ignored since we provide a video path.
+    dummy_image = np.zeros((256, 256, 3), dtype=np.uint8)
+
     # Find all trajectory files in the data directory
     parquet_files = sorted(list(data_dir.glob("data/**/*.parquet")))
     if not parquet_files:
@@ -104,6 +107,7 @@ def main(data_dir: Path):
 
             dataset.add_frame(
                 {
+                    "observation.images.ego_view": dummy_image,
                     "observation.state": np.array(row["observation.state"], dtype=np.float32),
                     "action": np.array(row["action"], dtype=np.float32),
                     "task": task_description,
